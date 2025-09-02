@@ -1,3 +1,5 @@
 build
 libvortekpatcher/build
 libvortekrenderer.so.new
+.venv/*
+android-sdk/*

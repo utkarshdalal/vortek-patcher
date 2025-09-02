@@ -299,6 +299,9 @@ static void (*original_TextureDecoder_decodeAll)(void* self);
 static void (*original_vt_handle_vkCmdCopyBufferToImage)(void* ctx);
 static void (*original_vt_handle_vkCmdCopyBufferToImage2)(void* ctx);
 static void (*original_vt_handle_vkEndCommandBuffer)(void* ctx);
+static void (*original_vt_handle_vkGetPhysicalDeviceProperties)(void* ctx);
+static void (*original_vt_handle_vkGetPhysicalDeviceProperties2)(void* ctx);
+static void (*original_vt_handle_vkEnumerateInstanceVersion)(void* ctx);
 static void* (*original_getHandleRequestFunc)(unsigned short);
 
 static long (*old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext)(JNIEnv* env, jobject thiz, int fd, jobject options);
@@ -457,6 +460,98 @@ void my_vt_handle_vkEndCommandBuffer(void* ctx) {
     }
 
     original_vt_handle_vkEndCommandBuffer(ctx);
+}
+
+#define VK_1_3  VK_MAKE_VERSION(1,3,0)
+
+extern "C"
+void my_vt_handle_vkEnumerateInstanceVersion(void *ctx)
+{
+    LOGI("Forced vkEnumerateInstanceVersion → 1.3");
+    LOGI("dump ctx @%p", ctx);
+    for (int i = 0; i < 0x80; i += 8) {
+        LOGI("  +0x%02x  %016lx",
+            i, *(unsigned long *)((char*)ctx + i));
+    }
+    original_vt_handle_vkEnumerateInstanceVersion(ctx);
+    uint32_t *reply = *(uint32_t **)((char*)ctx + 0x28);
+    if (reply) {
+        reply[1] = VK_1_3;
+        LOGI("Really forced EnumerateInstanceVersion → 1.3");
+    }
+}
+
+extern "C"
+void my_vt_handle_vkGetPhysicalDeviceProperties(void *ctx)
+{
+    LOGI("Forced apiVersion in GetPhysicalDeviceProperties → 1.3");
+    LOGI("dump ctx @%p", ctx);
+    for (int i = 0; i < 0x80; i += 8) {
+        LOGI("  +0x%02x  %016lx",
+            i, *(unsigned long *)((char*)ctx + i));
+    }
+    original_vt_handle_vkGetPhysicalDeviceProperties(ctx);
+    VkPhysicalDeviceProperties *props =
+        *(VkPhysicalDeviceProperties **)((char*)ctx + 0x28);
+    if (props) {                 // ← guard it
+        props->apiVersion = VK_1_3;
+        LOGI("Really forced apiVersion patched to 1.3  props=%p", props);
+    } else {
+        LOGI("props ptr is NULL – skipping patch");
+    }
+}
+
+extern "C"
+void my_vt_handle_vkGetPhysicalDeviceProperties2(void* ctx)
+{
+    LOGI("patch GetPhysicalDeviceProperties2");
+
+    LOGI("dump ctx @%p", ctx);
+    for (int i = 0; i < 0x80; i += 8) {
+        LOGI("  +0x%02x  %016lx",
+            i, *(unsigned long *)((char*)ctx + i));
+    }
+    // call real handler first
+    original_vt_handle_vkGetPhysicalDeviceProperties2(ctx);
+
+    // reply pointer is at +0x28 (same as the simple props case)
+    VkPhysicalDeviceProperties2* hdr =
+        *(VkPhysicalDeviceProperties2**)((char*)ctx + 0x28);
+    if (hdr) {                 // ← guard it
+        LOGI("Really patched VkPhysicalDeviceProperties2  hdr=%p", hdr);
+    } else {
+        LOGI("hdr ptr is NULL – skipping patch");
+    }
+
+    /* Walk the pNext chain and fix the bits vkd3d cares about               *
+     * We only need two structs for now:                                     *
+     *   VkPhysicalDeviceTexelBufferAlignmentProperties  (Vulkan 1.2)        *
+     *   VkPhysicalDeviceVulkan13Properties              (Vulkan 1.3)        */
+
+    for (void* p = hdr->pNext; p; p = *(void**)p /* pNext field */) {
+        VkStructureType sType = *(VkStructureType*)p;
+        switch (sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES: {
+            auto* t = (VkPhysicalDeviceTexelBufferAlignmentProperties*)p;
+            /* Adreno drivers typically guarantee 4-byte alignment           */
+            t->storageTexelBufferOffsetAlignmentBytes     = 4;
+            t->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+            t->uniformTexelBufferOffsetAlignmentBytes     = 4;
+            t->uniformTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES: {
+            auto* v13 = (VkPhysicalDeviceVulkan13Properties*)p;
+            /* Pick conservative values that satisfy vkd3d/DXVK              */
+            v13->storageTexelBufferOffsetAlignmentBytes = 4;
+            v13->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+            break;
+        }
+        default:
+            /* nothing to do */
+            break;
+        }
+    }
 }
 
 #define TASK_QUEUE(self) (&((char*)self)[0x28])
@@ -694,6 +789,10 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     *((void**)&original_##sym) = (void*) handleRequestFuncs[index - 100]; \
     handleRequestFuncs[index - 100] = (void*) &my_##sym; }
 
+
+    PATCH(vt_handle_vkGetPhysicalDeviceProperties2, 0xf9); // index = 0xf9-0x64 = 0x95
+    PATCH(vt_handle_vkEnumerateInstanceVersion, 0x6f);   // 0x6f-0x64 = **11**
+    PATCH(vt_handle_vkGetPhysicalDeviceProperties,  0x67);   // 0x67-0x64 = 3
     if (enable_bc)
         PATCH(vt_handle_vkCmdCopyBufferToImage, 0xd7);
     PATCH(vt_handle_vkCmdCopyBufferToImage2, 0x146);
