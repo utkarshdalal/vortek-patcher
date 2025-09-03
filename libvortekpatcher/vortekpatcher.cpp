@@ -12,9 +12,33 @@
 #include <string>
 #include <sstream>
 #include <sys/mman.h>
+#include <elf.h>
+#include <link.h>
 
 #define BGR 1;
 #include "bcdec.h"
+
+static size_t find_got_offset(void* base /* dlsym handle */, const char* wanted) {
+    ElfW(Ehdr)* eh = (ElfW(Ehdr)*) base;
+    ElfW(Phdr)* ph = (ElfW(Phdr)*)((char*)eh + eh->e_phoff);
+    for (int i = 0; i < eh->e_phnum; ++i) if (ph[i].p_type == PT_DYNAMIC) {
+        ElfW(Dyn)* dyn = (ElfW(Dyn)*)(ph[i].p_vaddr + (char*)eh);
+        ElfW(Sym)* symtab = 0; const char* strtab = 0; ElfW(Rela)* jmprel = 0; size_t relasz = 0;
+        for (; dyn->d_tag != DT_NULL; ++dyn) switch (dyn->d_tag) {
+            case DT_SYMTAB:   symtab = (ElfW(Sym)*)(dyn->d_un.d_ptr + (char*)eh); break;
+            case DT_STRTAB:   strtab = (const char*)(dyn->d_un.d_ptr + (char*)eh); break;
+            case DT_JMPREL:   jmprel = (ElfW(Rela)*)(dyn->d_un.d_ptr + (char*)eh); break;
+            case DT_PLTRELSZ: relasz = dyn->d_un.d_val; break;
+        }
+        size_t ents = relasz / sizeof(ElfW(Rela));
+        for (size_t n = 0; n < ents; ++n) {
+            size_t idx = ELF64_R_SYM(jmprel[n].r_info);
+            if (strcmp(strtab + symtab[idx].st_name, wanted) == 0)
+                return jmprel[n].r_offset; // GOT offset inside image
+        }
+    }
+    return 0;
+}
 
 const char* get_vulkan_call_name(int command_id) {
     switch (command_id) {
@@ -303,6 +327,10 @@ static void (*original_vt_handle_vkGetPhysicalDeviceProperties)(void* ctx);
 static void (*original_vt_handle_vkGetPhysicalDeviceProperties2)(void* ctx);
 static void (*original_vt_handle_vkEnumerateInstanceVersion)(void* ctx);
 static void* (*original_getHandleRequestFunc)(unsigned short);
+static void *(*real_dlopen)(const char*, int) = nullptr;
+static void *(*real_android_dlopen_ext)(const char*, int, const void*) = nullptr;
+static void* (*real_lnb_dlopen)(const char* path, int flags, void* ns);
+static void* (*real_lnb_dlopen_unique)(const char* path, const char* caller, uint32_t flags, void* ns);
 
 static long (*old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext)(JNIEnv* env, jobject thiz, int fd, jobject options);
 static int (*ArrayDeque_isEmpty)(void* deque);
@@ -317,6 +345,7 @@ static void (*TextureDecoder_copyBufferToImage)(void*, VkCommandBuffer          
                                            VkImageLayout                               dstImageLayout);
 
 static ArrayDeque image_regions;
+static const char *kMyVk = "vulkan.ad8190.so";
 
 void* my_getHandleRequestFunc(unsigned short op) {
     if (op == 0x147 || op == 0xbf || op == 0xd8)
@@ -667,6 +696,30 @@ void my_TextureDecoder_decodeAll(void* self) {
     }
 }
 
+static void *my_dlopen(const char *file, int flag) {
+    LOGI("my_dlopen: %s", file);
+    if (file && strcmp(file, "libvulkan.so") == 0) file = kMyVk;
+    return real_dlopen(file, flag);
+}
+
+static void *my_android_dlopen_ext(const char *file, int flag, const void *extinfo) {
+    LOGI("my_android_dlopen_ext: %s", file);
+    if (file && strcmp(file, "libvulkan.so") == 0) file = kMyVk;
+    return real_android_dlopen_ext(file, flag, extinfo);
+}
+
+static void* my_lnb_dlopen(const char* path, int flags, void* ns) {
+    LOGI("lnb_dlopen: %s", path);
+    if (path && strcmp(path, "/system/lib64/libvulkan.so") == 0) path = kMyVk;
+    return real_lnb_dlopen(path, flags, ns);
+}
+
+static void* my_lnb_dlopen_unique(const char* path, const char* caller, uint32_t flags, void* ns) {
+    LOGI("lnb_dlopen_unique: %s", path);
+    if (path && strcmp(path, "/system/lib64/libvulkan.so") == 0) path = kMyVk;
+    return real_lnb_dlopen_unique(path, caller, flags, ns);
+}
+
 
 // Intercepts vkCreateInstance _between_ Vortek and the underlying libvulkan.so
 // and inject a single VK_LAYER_KHRONOS_validation layer
@@ -753,9 +806,33 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     LOGI("Inside of VortekRendererComponent::createVkContext.");
 
     void* libvortekrenderer = dlopen("libvortekrenderer.so", RTLD_NOW);
+    char* base_addr = (char*) findLibraryBase("libvortekrenderer.so");
 #define SAVE(obj) *((void**)&obj) = dlsym(libvortekrenderer, #obj)
 
+    // --- PATCH FIRST (before calling the original) ---
+    // Resolve GOT offsets at runtime so you don't rely on 0x3b9f0
+    size_t off_dlopen = 0x915e8;
+    size_t off_android = 0x91a38;
+    static const size_t OFF_LNB      = 0x919c0;
+    static const size_t OFF_LNB_UNIQ = 0x919e0;
+
+    patch_got(base_addr, OFF_LNB,      (void**)&real_lnb_dlopen,        (void*)&my_lnb_dlopen);
+    patch_got(base_addr, OFF_LNB_UNIQ, (void**)&real_lnb_dlopen_unique, (void*)&my_lnb_dlopen_unique);
+    if (off_dlopen) {
+        LOGI("Patching GOT for dlopen at 0x%zx", off_dlopen);
+        patch_got(base_addr, off_dlopen, (void**)&real_dlopen, (void*)&my_dlopen);
+    }
+    if (off_android) {
+        LOGI("Patching GOT for android_dlopen_ext at 0x%zx", off_android);
+        patch_got(base_addr, off_android, (void**)&real_android_dlopen_ext, (void*)&my_android_dlopen_ext);
+    }
+
+    // (optional) print current GOT pointers to verify
+    if (off_dlopen)   LOGI("dlopen GOT now -> %p", *((void**)(base_addr + off_dlopen)));
+    if (off_android)  LOGI("android_dlopen_ext GOT now -> %p", *((void**)(base_addr + off_android)));
+
     // Call the original VortekRendererComponent::createVkContext first to set up the vulkanWrapper pointers
+    LOGI("RTLD_NOLOAD(libvulkan.so) -> %p", dlopen("libvulkan.so", RTLD_NOLOAD));
     SAVE(old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext);
     long result = old_Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext(env, thiz, fd, options);
 
@@ -763,7 +840,6 @@ JNIEXPORT long Java_com_winlator_xenvironment_components_VortekRendererComponent
     int enable_logging = is_enabled("debug.vt.logging");
     int enable_dump_api = is_enabled("debug.vt.dump_api");
 
-    char* base_addr = (char*) findLibraryBase("libvortekrenderer.so");
     // Patch the TextureDecoder_decodeAll, which is at +0x3bb30 from the start of the image
     if (enable_bc)
         patch_got(base_addr, 0x3bb30,
